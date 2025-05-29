@@ -1,0 +1,700 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import os
+from urllib.parse import urljoin
+import re
+
+class IWRPScraper:
+    def __init__(self):
+        self.base_url = "http://iwrp.net"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        self.competitions_data = []
+        self.clean_results_data = []
+        self.zero_results_data = []
+        
+    def get_competitions_list(self, limit=None):
+        """Scrape the main competitions table"""
+        print("Fetching competitions from main website...")
+        
+        try:
+            response = self.session.get(self.base_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            table = soup.find('table', {'id': 'stat_tab'})
+            if not table:
+                print("❌ Could not find competitions table")
+                return []
+            
+            tbody = table.find('tbody')
+            if not tbody:
+                print("❌ Could not find table body")
+                return []
+                
+            rows = tbody.find_all('tr')
+            
+            for i, row in enumerate(rows):
+                if limit and i >= limit:
+                    break
+                    
+                cols = row.find_all('td')
+                if len(cols) >= 6:
+                    name_cell = cols[1]
+                    link_element = name_cell.find('a')
+                    comp_url = None
+                    comp_name = name_cell.get_text(strip=True)
+                    
+                    if link_element and link_element.get('href'):
+                        comp_url = urljoin(self.base_url, link_element['href'])
+                    
+                    # Handle gender mapping
+                    gender_text = cols[4].get_text(strip=True)
+                    if gender_text in ['Males', 'Females']:
+                        athlete_sex = gender_text
+                    else:
+                        athlete_sex = 'Unknown'
+                    
+                    competition = {
+                        'date': cols[0].get_text(strip=True),
+                        'name': comp_name,
+                        'competition_location': cols[2].get_text(strip=True),
+                        'nation': cols[3].get_text(strip=True),
+                        'athlete_sex': athlete_sex,
+                        'age_category': cols[5].get_text(strip=True),
+                        'url': comp_url
+                    }
+                    
+                    self.competitions_data.append(competition)
+                    
+            print(f"✅ Found {len(self.competitions_data)} competitions")
+            return self.competitions_data
+            
+        except Exception as e:
+            print(f"❌ Error fetching competitions: {e}")
+            return []
+    
+    def _check_lift_result(self, cell):
+        """Check if a lift was successful, unsuccessful, or no attempt"""
+        if not cell:
+            return 'na'
+        
+        # Get the text content
+        text = cell.get_text(strip=True)
+        
+        # Check for no attempt indicators
+        if text in ['---', '', 'X', 'x', 'DNS', 'DNF', '0']:
+            return 'na'
+        
+        # Look for span elements with strikethrough styling (unsuccessful lifts)
+        spans = cell.find_all('span')
+        for span in spans:
+            style = span.get('style', '')
+            # Check for red color and strikethrough
+            if ('line-through' in style and 'red' in style) or \
+               ('text-decoration' in style and 'line-through' in style):
+                return 'u'
+        
+        # Check if the cell itself has unsuccessful styling
+        cell_style = cell.get('style', '')
+        if ('line-through' in cell_style and 'red' in cell_style) or \
+           ('text-decoration' in cell_style and 'line-through' in cell_style):
+            return 'u'
+        
+        # Check for specific CSS classes that might indicate failed lifts
+        cell_classes = cell.get('class', [])
+        if any('fail' in str(cls).lower() or 'unsuccessful' in str(cls).lower() for cls in cell_classes):
+            return 'u'
+        
+        # If we have a number and no failure indicators, it's successful
+        if re.match(r'^\d+\.?\d*$', text):
+            return 's'
+        
+        # Default to no attempt for anything else
+        return 'na'
+    
+    def _is_empty_spacer_cell(self, cell):
+        """Check if cell is an empty spacer column that should be skipped"""
+        if not cell:
+            return False
+        
+        # Check for rowspan="2" with empty content
+        if cell.get('rowspan') == '2':
+            text = cell.get_text(strip=True)
+            # Empty or just non-breaking space
+            if text in ['', '&nbsp;'] or text == '\xa0':
+                return True
+        
+        return False
+    
+    def _filter_data_cells(self, cells):
+        """Filter out empty spacer cells and return clean data cells with their positions"""
+        filtered_cells = []
+        filtered_texts = []
+        original_positions = []
+        
+        for i, cell in enumerate(cells):
+            if not self._is_empty_spacer_cell(cell):
+                filtered_cells.append(cell)
+                filtered_texts.append(cell.get_text(strip=True))
+                original_positions.append(i)
+        
+        return filtered_cells, filtered_texts, original_positions
+    
+    def scrape_competition_results(self, competition, comp_index, total_comps):
+        """Scrape individual competition results with zero-result logging"""
+        print(f"({comp_index+1}/{total_comps})", end=" ")
+        
+        if not competition['url']:
+            print("❌")
+            self.zero_results_data.append({
+                'competition_name': competition['name'],
+                'competition_date': competition['date'],
+                'competition_location': competition['competition_location'],
+                'athlete_sex': competition['athlete_sex'],
+                'url': 'NO URL PROVIDED',
+                'reason': 'Missing URL',
+                'tables_found': 0,
+                'total_rows': 0,
+                'error_details': 'No URL available for this competition'
+            })
+            return []
+        
+        try:
+            response = self.session.get(competition['url'], timeout=30)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            tables = soup.find_all('table')
+            competition_results = []
+            
+            total_rows = 0
+            for table in tables:
+                total_rows += len(table.find_all('tr'))
+            
+            for table_idx, table in enumerate(tables):
+                table_results = self._parse_weightlifting_table(table, competition)
+                if table_results:
+                    competition_results.extend(table_results)
+            
+            print(f"✅ {len(competition_results)}")
+            
+            # Log if no results found
+            if len(competition_results) == 0:
+                self.zero_results_data.append({
+                    'competition_name': competition['name'],
+                    'competition_date': competition['date'],
+                    'competition_location': competition['competition_location'],
+                    'athlete_sex': competition['athlete_sex'],
+                    'url': competition['url'],
+                    'reason': 'No athletes extracted',
+                    'tables_found': len(tables),
+                    'total_rows': total_rows,
+                    'error_details': f'Found {len(tables)} tables with {total_rows} total rows but extracted 0 athletes'
+                })
+            
+            return competition_results
+            
+        except Exception as e:
+            print(f"❌")
+            self.zero_results_data.append({
+                'competition_name': competition['name'],
+                'competition_date': competition['date'],
+                'competition_location': competition['competition_location'],
+                'athlete_sex': competition['athlete_sex'],
+                'url': competition['url'],
+                'reason': 'Scraping error',
+                'tables_found': 0,
+                'total_rows': 0,
+                'error_details': str(e)
+            })
+            return []
+    
+    def _parse_weightlifting_table(self, table, competition):
+        """Parse weightlifting results table with support for both traditional and team formats"""
+        try:
+            results = []
+            rows = table.find_all('tr')
+            
+            if len(rows) < 3:
+                return []
+            
+            current_weight_class = 'Unknown'
+            header_found = False
+            table_format = None
+            
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                if not cells:
+                    continue
+                
+                cell_texts = [cell.get_text(strip=True) for cell in cells]
+                
+                # Check for ANY category header (flexible detection)
+                if len(cell_texts) == 1 and self._is_category_header(cell_texts[0]):
+                    current_weight_class = cell_texts[0]
+                    header_found = False
+                    table_format = None
+                    continue
+                
+                # Check for headers
+                if self._is_header_row(cell_texts):
+                    header_found = True
+                    table_format = self._analyze_table_format(cell_texts)
+                    continue
+                
+                # Skip sub-headers
+                if self._is_subheader_row(cell_texts):
+                    continue
+                
+                # Parse athlete data - NOW WORKS FOR ANY FORMAT
+                if header_found and self._is_athlete_row(cells, cell_texts):
+                    athlete_data = self._parse_athlete_row_improved(cells, competition, current_weight_class, table_format)
+                    if athlete_data:
+                        results.append(athlete_data)
+            
+            return results
+            
+        except Exception as e:
+            return []
+    
+    def _is_category_header(self, text):
+        """Enhanced category header detection for both traditional and team competitions"""
+        if not text or len(text.strip()) < 2:
+            return False
+        
+        # Skip obviously non-category text
+        skip_patterns = ['pl', 'place', 'name', 'surname', 'nation', 'club', 'snatch', 'jerk', 'total', 'sincler', 'b.w', 'gr.', 'birthyear', 'points']
+        if any(pattern in text.lower() for pattern in skip_patterns):
+            return False
+        
+        # Skip pure numbers or very short text
+        if text.isdigit() or len(text) < 2:
+            return False
+        
+        # Skip obvious table data
+        if re.match(r'^\d+\.\d+$', text):
+            return False
+        
+        # TEAM FORMAT INDICATORS
+        team_indicators = [
+            'KS ', 'LKS', 'MKS', 'AKS', 'GCK', 'CLKS', 'UOLKA', 'MLKS',
+            'SV ', 'TV ', 'TSV', 'SC ', 'FC ',
+            'Club', 'Team', 'Sport', 'Athletic', 'Association',
+            'Budowlani', 'Germania', 'Polonia'
+        ]
+        
+        if any(indicator in text for indicator in team_indicators):
+            return True
+        
+        # TRADITIONAL FORMAT
+        traditional_patterns = [
+            r'^\d+\s*kg$',
+            r'^\+\s*\d+\s*kg$',
+            r'^\d+\s*\+\s*kg$'
+        ]
+        if any(re.match(pattern, text, re.IGNORECASE) for pattern in traditional_patterns):
+            return True
+        
+        # Common categories
+        categories = ['open', 'masters', 'youth', 'junior', 'senior', 'novice', 'elite', 'university', 'military']
+        if any(cat in text.lower() for cat in categories):
+            return True
+        
+        if len(text) > 4:
+            return True
+        
+        return False
+    
+    def _analyze_table_format(self, header_texts):
+        """Enhanced table format analysis"""
+        header_str = ' '.join(header_texts).lower()
+        
+        if 'birthyear' in header_str or 'points' in header_str:
+            return 'team_format'
+        
+        if 'nation' in header_str:
+            return 'nation_format'
+        elif 'club' in header_str:
+            return 'club_format'
+        
+        if len(header_texts) >= 15:
+            return 'nation_format'
+        elif 'surname' in header_str and len(header_texts) < 12:
+            return 'team_format'
+        else:
+            return 'club_format'
+    
+    def _is_header_row(self, cell_texts):
+        """Enhanced header detection for both traditional and team formats"""
+        traditional_keywords = ['pl', 'surname', 'name', 'nation', 'club', 'snatch', 'jerk', 'total', 'sincler', 'b.w']
+        team_keywords = ['birthyear', 'points', 'name and surname']
+        
+        text = ' '.join(cell_texts).lower()
+        
+        return (any(keyword in text for keyword in traditional_keywords) or 
+                any(keyword in text for keyword in team_keywords))
+    
+    def _is_subheader_row(self, cell_texts):
+        """Check if this is a subheader row"""
+        if len(cell_texts) <= 6:
+            return all(text.isdigit() and int(text) <= 3 for text in cell_texts if text)
+        return False
+    
+    def _is_athlete_row(self, cells, cell_texts):
+        """Enhanced athlete row detection"""
+        if len(cell_texts) < 3:
+            return False
+        
+        # Check for athlete link
+        if len(cells) > 1:
+            name_cell = cells[1]
+            if name_cell.find('a'):
+                return True
+        
+        first_cell = cell_texts[0]
+        
+        # Regular placed athletes
+        if first_cell.isdigit():
+            return True
+        
+        # DNF cases
+        if first_cell in ['DNF', 'DNS', 'DQ', '---', '']:
+            if len(cell_texts) > 1:
+                name_text = cell_texts[1]
+                if len(name_text) > 2 and any(c.isalpha() for c in name_text):
+                    return True
+        
+        # TEAM FORMAT detection
+        if len(first_cell) > 3 and any(c.isalpha() for c in first_cell):
+            if len(cell_texts) > 1:
+                second_cell = cell_texts[1]
+                if re.match(r'^(19|20)\d{2}$', second_cell):
+                    return True
+                if re.match(r'^\d+\.?\d*$', second_cell):
+                    return True
+        
+        return False
+    
+    def _is_weight_value(self, text):
+        """Check if text looks like a weight value (bodyweight)"""
+        if not text or text in ['---', 'DNS', 'DNF', '0']:
+            return False
+        return re.match(r'^\d+\.?\d*$', text) is not None
+    
+    def _is_country_code(self, text):
+        """Enhanced country code detection"""
+        if not text or len(text) != 3:
+            return False
+        
+        if not text.isupper():
+            return False
+        
+        common_codes = {
+            'POL', 'GER', 'USA', 'RUS', 'CHN', 'JPN', 'FRA', 'ITA', 'ESP', 'GBR', 'CAN', 'AUS',
+            'BRA', 'ARG', 'MEX', 'KOR', 'THA', 'IND', 'TUR', 'GRE', 'SWE', 'NOR', 'DEN', 'FIN',
+            'BUL', 'ROM', 'HUN', 'CZE', 'SVK', 'UKR', 'BLR', 'LTU', 'LAT', 'EST', 'MDA', 'GEO',
+            'ARM', 'AZE', 'KAZ', 'UZB', 'CYP', 'SRB', 'ALB', 'MNE', 'MKD', 'BIH', 'CRO', 'SLO'
+        }
+        
+        return text in common_codes
+    
+    def _parse_athlete_row_improved(self, cells, competition, weight_class, table_format):
+        """Enhanced athlete row parsing with spacer column filtering"""
+        try:
+            # FILTER OUT EMPTY SPACER CELLS FIRST
+            filtered_cells, cell_texts, original_positions = self._filter_data_cells(cells)
+            
+            if len(cell_texts) < 5:
+                return None
+            
+            # Initialize variables
+            nation = ''
+            club = ''
+            bodyweight_kg = ''
+            competition_group = ''
+            competition_standing = ''
+            name = ''
+            
+            if table_format == 'team_format':
+                # TEAM FORMAT: Name | Birthyear | B.W | Snatch123 | C&J123 | Total | Sinclair | Points
+                name = cell_texts[0] if len(cell_texts) > 0 else ''
+                birthyear = cell_texts[1] if len(cell_texts) > 1 else ''
+                bodyweight_kg = cell_texts[2] if len(cell_texts) > 2 else ''
+                
+                if weight_class and weight_class != 'Unknown':
+                    club = weight_class
+                
+                competition_standing = ''
+                lift_start_col = 3
+                
+            elif table_format == 'club_format':
+                # CLUB FORMAT: Place | Name | Club | BodyWeight | Lifts...
+                competition_standing = cell_texts[0] if cell_texts[0] else 'DNF'
+                if competition_standing in ['', '---', 'DNS', 'DQ']:
+                    competition_standing = 'DNF'
+                
+                name = cell_texts[1] if len(cell_texts) > 1 else ''
+                club = cell_texts[2] if len(cell_texts) > 2 else ''
+                bodyweight_kg = cell_texts[3] if len(cell_texts) > 3 else ''
+                lift_start_col = 4
+                
+            elif table_format == 'nation_format':
+                # NATION FORMAT: Place | Name | Nation | BodyWeight | Group | Lifts...
+                competition_standing = cell_texts[0] if cell_texts[0] else 'DNF'
+                if competition_standing in ['', '---', 'DNS', 'DQ']:
+                    competition_standing = 'DNF'
+                
+                name = cell_texts[1] if len(cell_texts) > 1 else ''
+                nation = cell_texts[2] if len(cell_texts) > 2 else ''
+                bodyweight_kg = cell_texts[3] if len(cell_texts) > 3 else ''
+                competition_group = cell_texts[4] if len(cell_texts) > 4 else ''
+                lift_start_col = 5
+                
+            else:
+                # DYNAMIC DETECTION
+                competition_standing = cell_texts[0] if cell_texts[0] else 'DNF'
+                if competition_standing in ['', '---', 'DNS', 'DQ']:
+                    competition_standing = 'DNF'
+                
+                name = cell_texts[1] if len(cell_texts) > 1 else ''
+                
+                # Look for bodyweight
+                bodyweight_col = None
+                for i in range(2, min(6, len(cell_texts))):
+                    if self._is_weight_value(cell_texts[i]):
+                        bodyweight_col = i
+                        bodyweight_kg = cell_texts[i]
+                        break
+                
+                if bodyweight_col is None:
+                    bodyweight_col = 3
+                    bodyweight_kg = cell_texts[3] if len(cell_texts) > 3 else ''
+                
+                # Determine nation vs club
+                org_text = cell_texts[2] if len(cell_texts) > 2 else ''
+                if self._is_country_code(org_text):
+                    nation = org_text
+                    club = ''
+                    competition_group = cell_texts[bodyweight_col + 1] if len(cell_texts) > bodyweight_col + 1 else ''
+                    lift_start_col = bodyweight_col + 2
+                else:
+                    nation = ''
+                    club = org_text
+                    competition_group = ''
+                    lift_start_col = bodyweight_col + 1
+            
+            # Skip if no proper name
+            if not name or len(name) < 2:
+                return None
+            
+            # Validate group isn't lift data
+            if competition_group and re.match(r'^\d+\.?\d*$', competition_group):
+                competition_group = ''
+            
+            # Extract snatch attempts (using filtered cells)
+            snatch_1 = cell_texts[lift_start_col] if len(cell_texts) > lift_start_col else ''
+            snatch_1_result = self._check_lift_result(filtered_cells[lift_start_col]) if len(filtered_cells) > lift_start_col else 'na'
+            
+            snatch_2 = cell_texts[lift_start_col + 1] if len(cell_texts) > lift_start_col + 1 else ''
+            snatch_2_result = self._check_lift_result(filtered_cells[lift_start_col + 1]) if len(filtered_cells) > lift_start_col + 1 else 'na'
+            
+            snatch_3 = cell_texts[lift_start_col + 2] if len(cell_texts) > lift_start_col + 2 else ''
+            snatch_3_result = self._check_lift_result(filtered_cells[lift_start_col + 2]) if len(filtered_cells) > lift_start_col + 2 else 'na'
+            
+            # Clean & Jerk attempts (skip ranking column)
+            cj_start = lift_start_col + 4
+            
+            clean_jerk_1 = cell_texts[cj_start] if len(cell_texts) > cj_start else ''
+            clean_jerk_1_result = self._check_lift_result(filtered_cells[cj_start]) if len(filtered_cells) > cj_start else 'na'
+            
+            clean_jerk_2 = cell_texts[cj_start + 1] if len(cell_texts) > cj_start + 1 else ''
+            clean_jerk_2_result = self._check_lift_result(filtered_cells[cj_start + 1]) if len(filtered_cells) > cj_start + 1 else 'na'
+            
+            clean_jerk_3 = cell_texts[cj_start + 2] if len(cell_texts) > cj_start + 2 else ''
+            clean_jerk_3_result = self._check_lift_result(filtered_cells[cj_start + 2]) if len(filtered_cells) > cj_start + 2 else 'na'
+            
+            # Extract totals (skip C&J ranking column)
+            total_kg = cell_texts[cj_start + 4] if len(cell_texts) > cj_start + 4 else ''
+            sinclair = cell_texts[cj_start + 5] if len(cell_texts) > cj_start + 5 else ''
+            
+            return {
+                'competition_name': competition['name'],
+                'competition_date': competition['date'],
+                'competition_location': competition['competition_location'],
+                'competition_nation': competition['nation'],
+                'athlete_sex': competition['athlete_sex'],
+                'competition_age_category': competition['age_category'],
+                'competition_url': competition['url'],
+                'weight_class': weight_class,
+                'competition_standing': competition_standing,
+                'athlete_name': name,
+                'nation': nation,
+                'club': club,
+                'bodyweight_kg': bodyweight_kg,
+                'competition_group': competition_group,
+                'snatch_1': snatch_1,
+                'snatch_1_result': snatch_1_result,
+                'snatch_2': snatch_2,
+                'snatch_2_result': snatch_2_result,
+                'snatch_3': snatch_3,
+                'snatch_3_result': snatch_3_result,
+                'clean_jerk_1': clean_jerk_1,
+                'clean_jerk_1_result': clean_jerk_1_result,
+                'clean_jerk_2': clean_jerk_2,
+                'clean_jerk_2_result': clean_jerk_2_result,
+                'clean_jerk_3': clean_jerk_3,
+                'clean_jerk_3_result': clean_jerk_3_result,
+                'total_kg': total_kg,
+                'sinclair': sinclair
+            }
+            
+        except Exception as e:
+            return None
+    
+    def run_scraper(self, num_competitions=None):
+        """Main scraping function with minimal output"""
+        print("🏋️ IWRP Weightlifting Data Scraper\n")
+        
+        competitions = self.get_competitions_list(limit=num_competitions)
+        
+        if not competitions:
+            print("❌ No competitions found")
+            return
+        
+        print(f"\n🔄 Scraping {len(competitions)} competitions...")
+        
+        for i, comp in enumerate(competitions):
+            results = self.scrape_competition_results(comp, i, len(competitions))
+            self.clean_results_data.extend(results)
+            
+            # Show progress every 50 competitions
+            if (i + 1) % 50 == 0:
+                print(f"\n📊 Progress: {i+1}/{len(competitions)} | Total athletes: {len(self.clean_results_data)} | Zero results: {len(self.zero_results_data)}")
+        
+        print(f"\n✅ Complete! {len(competitions)} competitions, {len(self.clean_results_data)} athletes")
+        print(f"🔍 Zero results logged: {len(self.zero_results_data)} competitions")
+    
+    def export_to_excel(self, filename="iwrp_weightlifting_clean.xlsx"):
+        """Export clean data to Excel with formatting and zero-results log"""
+        print(f"\n📄 Exporting to {filename}...")
+        
+        try:
+            from openpyxl.styles import Alignment
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                # Competitions sheet
+                if self.competitions_data:
+                    competitions_df = pd.DataFrame(self.competitions_data)
+                    competitions_df.to_excel(writer, sheet_name='Competitions', index=False)
+                
+                # Athletes results sheet
+                if self.clean_results_data:
+                    results_df = pd.DataFrame(self.clean_results_data)
+                    results_df.to_excel(writer, sheet_name='Athletes_Results', index=False)
+                    
+                    # Summary sheet
+                    summary_data = []
+                    for comp_name in results_df['competition_name'].unique():
+                        comp_data = results_df[results_df['competition_name'] == comp_name]
+                        summary_data.append({
+                            'competition_name': comp_name,
+                            'total_athletes': len(comp_data),
+                            'unique_categories': len(comp_data['weight_class'].unique()),
+                            'nations': len(comp_data[comp_data['nation'] != '']['nation'].unique()),
+                            'clubs': len(comp_data[comp_data['club'] != '']['club'].unique()),
+                            'dnf_count': len(comp_data[comp_data['competition_standing'] == 'DNF']),
+                            'team_competitions': len(comp_data[comp_data['competition_standing'] == ''])
+                        })
+                    
+                    summary_df = pd.DataFrame(summary_data)
+                    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Zero results sheet
+                if self.zero_results_data:
+                    zero_results_df = pd.DataFrame(self.zero_results_data)
+                    zero_results_df.to_excel(writer, sheet_name='Zero_Results_Debug', index=False)
+                
+                # Format the Excel sheets
+                self._format_excel_sheets(writer)
+                
+            print(f"✅ Export complete: {filename}")
+            print("\n📋 Enhanced Features:")
+            print("   • Automatic spacer column detection and removal")
+            print("   • Fixed column alignment issues")
+            print("   • Proper lift data extraction")
+            print("   • Support for all competition formats")
+            
+        except Exception as e:
+            print(f"❌ Export error: {e}")
+    
+    def _format_excel_sheets(self, writer):
+        """Format Excel sheets with auto-sizing and alignment"""
+        try:
+            from openpyxl.styles import Alignment
+            
+            for sheet_name in writer.sheets:
+                worksheet = writer.sheets[sheet_name]
+                
+                # Auto-size all columns
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+                
+                # Center align all columns except A
+                for row in worksheet.iter_rows():
+                    for i, cell in enumerate(row):
+                        if i > 0:  # Skip column A (index 0)
+                            cell.alignment = Alignment(horizontal='center', vertical='center')
+                        else:  # Column A - left align
+                            cell.alignment = Alignment(horizontal='left', vertical='center')
+                            
+        except ImportError:
+            print("⚠️  Note: Install openpyxl for advanced formatting: pip install openpyxl")
+        except Exception as e:
+            print(f"⚠️  Formatting warning: {e}")
+
+# Main execution
+if __name__ == "__main__":
+    scraper = IWRPScraper()
+    
+    # Ask user how many competitions
+    while True:
+        try:
+            user_input = input("How many competitions to scrape? (number or 'all'): ").strip()
+            
+            if user_input.lower() == 'all':
+                num_test = None
+                print("Will scrape ALL competitions")
+                break
+            else:
+                num_test = int(user_input)
+                if num_test > 0:
+                    print(f"Will scrape {num_test} competitions")
+                    break
+                else:
+                    print("Please enter a positive number or 'all'")
+        except ValueError:
+            print("Please enter a valid number or 'all'")
+    
+    # Confirm and run
+    confirm = input(f"\nReady to start? (y/n): ").strip().lower()
+    if confirm == 'y':
+        scraper.run_scraper(num_competitions=num_test)
+        scraper.export_to_excel()
+        print("\n🎉 All done!")
+    else:
+        print("Cancelled.")
