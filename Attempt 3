@@ -1,0 +1,469 @@
+import requests
+from bs4 import BeautifulSoup
+import csv
+import re
+import os
+from datetime import datetime
+from tqdm import tqdm
+import time
+import logging
+from urllib.parse import urljoin
+from collections import defaultdict
+
+class WeightliftingScraper:
+    def __init__(self):
+        self.base_url = "http://iwrp.net/"
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        
+        logging.basicConfig(level=logging.ERROR)
+        self.logger = logging.getLogger(__name__)
+        
+        self.csv_headers = [
+            'competition_name', 'competition_date', 'competition_location', 
+            'competition_nation_host', 'athlete_sex', 'competition_age_category',
+            'competition_url', 'weight_class', 'competition_standing', 
+            'athlete_name', 'nation', 'club', 'bodyweight_kg', 'competition_group',
+            'snatch_1', 'snatch_1_result', 'snatch_2', 'snatch_2_result', 
+            'snatch_3', 'snatch_3_result', 'clean_jerk_1', 'clean_jerk_1_result',
+            'clean_jerk_2', 'clean_jerk_2_result', 'clean_jerk_3', 'clean_jerk_3_result',
+            'total_kg', 'sinclair'
+        ]
+
+    def get_homepage_competitions(self):
+        """Extract all competitions from the homepage"""
+        try:
+            response = self.session.get(self.base_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            competitions = []
+            
+            # Look for table with id="stattab" first
+            table = soup.find('table', {'id': 'stattab'})
+            
+            if not table:
+                # Alternative: find any table with many competition links
+                all_tables = soup.find_all('table')
+                for t in all_tables:
+                    rows = t.find_all('tr')
+                    if len(rows) > 50:
+                        links = t.find_all('a')
+                        competition_links = [l for l in links if 'zawody' in l.get('href', '') or 'contest' in l.get('href', '')]
+                        if len(competition_links) > 50:
+                            table = t
+                            break
+            
+            if not table:
+                return []
+            
+            tbody = table.find('tbody')
+            rows = tbody.find_all('tr') if tbody else table.find_all('tr')[1:]
+            
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 6:
+                    try:
+                        date_text = cells[0].get_text().strip()
+                        link_cell = cells[1].find('a')
+                        if not link_cell:
+                            continue
+                            
+                        comp_url = urljoin(self.base_url, link_cell.get('href', ''))
+                        comp_name = link_cell.get_text().strip()
+                        place = cells[2].get_text().strip()
+                        nation = cells[3].get_text().strip()
+                        gender = cells[4].get_text().strip()
+                        age_category = cells[5].get_text().strip()
+                        
+                        competition = {
+                            'date': date_text,
+                            'name': comp_name,
+                            'place': place,
+                            'nation': nation,
+                            'gender': gender,
+                            'age_category': age_category,
+                            'url': comp_url
+                        }
+                        
+                        competitions.append(competition)
+                        
+                    except Exception:
+                        continue
+            
+            return competitions
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching homepage: {e}")
+            return []
+
+    def filter_competitions_by_date(self, competitions):
+        """Filter competitions from 2000 onwards"""
+        filtered = []
+        for comp in competitions:
+            try:
+                date_formats = ['%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%d-%m-%Y']
+                date_obj = None
+                
+                for fmt in date_formats:
+                    try:
+                        date_obj = datetime.strptime(comp['date'], fmt)
+                        break
+                    except ValueError:
+                        continue
+                
+                if date_obj and date_obj.year >= 2000:
+                    filtered.append(comp)
+                    
+            except Exception:
+                continue
+        
+        return filtered
+
+    def scrape_competition_page(self, competition):
+        """COMPLETELY NEW APPROACH - PHYSICALLY SEPARATE HTML FOR EACH TABLE"""
+        try:
+            response = self.session.get(competition['url'], timeout=30)
+            response.raise_for_status()
+            
+            # Get raw HTML content
+            html_content = response.text
+            
+            print(f"  Processing: {competition['name']}")
+            
+            # STEP 1: Split HTML into individual table chunks
+            table_chunks = self._physically_separate_weight_class_tables(html_content)
+            
+            print(f"    Found {len(table_chunks)} weight class table chunks")
+            
+            all_results = []
+            
+            # STEP 2: Process each chunk completely independently
+            for chunk_index, (weight_class, table_html_chunk) in enumerate(table_chunks):
+                print(f"    Processing chunk {chunk_index + 1}: {weight_class}")
+                
+                # Create completely isolated soup ONLY for this chunk
+                isolated_soup = BeautifulSoup(table_html_chunk, 'html.parser')
+                
+                # Extract athletes from this isolated chunk only
+                chunk_athletes = self._extract_athletes_from_html_chunk(
+                    isolated_soup, weight_class, competition, chunk_index + 1
+                )
+                
+                print(f"      Chunk {chunk_index + 1}: Found {len(chunk_athletes)} athletes")
+                
+                # Add to results
+                all_results.extend(chunk_athletes)
+                
+                # Debug: Show first athlete from this chunk
+                if chunk_athletes:
+                    first_athlete = chunk_athletes[0]
+                    print(f"        Sample: {first_athlete['athlete_name']} -> {weight_class}")
+            
+            print(f"    Total athletes extracted: {len(all_results)}")
+            return all_results
+            
+        except Exception as e:
+            self.logger.error(f"Error scraping {competition['url']}: {e}")
+            return []
+
+    def _physically_separate_weight_class_tables(self, html_content):
+        """Physically split HTML into separate table chunks"""
+        table_chunks = []
+        
+        try:
+            # Find all table start/end positions
+            table_pattern = r'<table[^>]*class="[^"]*table table-striped table-responsive-md fixed_table[^"]*"[^>]*>.*?</table>'
+            
+            # Find all matches
+            matches = list(re.finditer(table_pattern, html_content, re.DOTALL))
+            
+            for match_index, match in enumerate(matches):
+                table_html = match.group(0)
+                
+                # Extract weight class from this specific table HTML
+                weight_class = self._extract_weight_class_from_html_chunk(table_html)
+                
+                if weight_class:
+                    table_chunks.append((weight_class, table_html))
+            
+            return table_chunks
+            
+        except Exception as e:
+            print(f"Error separating tables: {e}")
+            return []
+
+    def _extract_weight_class_from_html_chunk(self, table_html):
+        """Extract weight class from a single table HTML chunk"""
+        try:
+            # Look for weight class header pattern
+            header_pattern = r'<th[^>]*colspan="15"[^>]*>([^<]+)</th>'
+            
+            match = re.search(header_pattern, table_html)
+            if match:
+                header_text = match.group(1).strip()
+                
+                # Extract weight class
+                weight_patterns = [
+                    r'^(\+?\s*\d+(?:\.\d+)?)\s*kg\s*$',
+                    r'^(\d+(?:\.\d+)?)\s*kg\s*$'
+                ]
+                
+                for pattern in weight_patterns:
+                    weight_match = re.search(pattern, header_text)
+                    if weight_match:
+                        weight_value = weight_match.group(1).strip()
+                        return f"{weight_value} kg"
+            
+            return None
+            
+        except Exception:
+            return None
+
+    def _extract_athletes_from_html_chunk(self, isolated_soup, weight_class, competition, chunk_num):
+        """Extract athletes from a completely isolated HTML chunk"""
+        results = []
+        
+        try:
+            # This soup contains ONLY this weight class table
+            table = isolated_soup.find('table')
+            if not table:
+                return []
+            
+            tbody = table.find('tbody')
+            if not tbody:
+                return []
+            
+            # Get all rows from this isolated table
+            all_rows = tbody.find_all('tr')
+            
+            # Skip header rows
+            athlete_rows = all_rows[2:] if len(all_rows) > 2 else all_rows
+            
+            for row in athlete_rows:
+                cells = row.find_all('td')
+                if len(cells) < 14:
+                    continue
+                
+                try:
+                    # Extract placement
+                    placement = cells[0].get_text().strip()
+                    
+                    # Only process rows with valid placements
+                    if not placement or not re.match(r'^(\d+|)$', placement):
+                        continue
+                    
+                    # Extract athlete name
+                    athlete_name = cells[1].get_text().strip()
+                    if not athlete_name or len(athlete_name) < 2:
+                        continue
+                    
+                    # Skip header rows
+                    if athlete_name.lower() in ['surname and name', 'name', 'surname']:
+                        continue
+                    
+                    # Extract data from this row
+                    nation = cells[2].get_text().strip()
+                    bodyweight = cells[3].get_text().strip()
+                    group = cells[4].get_text().strip()
+                    
+                    # Extract lifts
+                    snatch_1, snatch_1_result = self._parse_lift_cell(cells[5])
+                    snatch_2, snatch_2_result = self._parse_lift_cell(cells[6])
+                    snatch_3, snatch_3_result = self._parse_lift_cell(cells[7])
+                    # cells[8] is snatch ranking
+                    clean_jerk_1, clean_jerk_1_result = self._parse_lift_cell(cells[9])
+                    clean_jerk_2, clean_jerk_2_result = self._parse_lift_cell(cells[10])
+                    clean_jerk_3, clean_jerk_3_result = self._parse_lift_cell(cells[11])
+                    # cells[12] is clean & jerk ranking
+                    total_kg = cells[13].get_text().strip() if len(cells) > 13 else ""
+                    sinclair = cells[14].get_text().strip() if len(cells) > 14 else ""
+                    
+                    # Clean up data
+                    if total_kg == "---":
+                        total_kg = ""
+                    if sinclair in ["0.0", "---"]:
+                        sinclair = ""
+                    
+                    # Create result - this athlete belongs ONLY to this weight class
+                    result = {
+                        'competition_name': competition['name'],
+                        'competition_date': competition['date'],
+                        'competition_location': competition['place'],
+                        'competition_nation_host': competition['nation'],
+                        'athlete_sex': competition['gender'],
+                        'competition_age_category': competition['age_category'],
+                        'competition_url': competition['url'],
+                        'weight_class': weight_class,  # ONLY this weight class
+                        'competition_standing': placement,
+                        'athlete_name': athlete_name,
+                        'nation': nation,
+                        'club': "",
+                        'bodyweight_kg': bodyweight,
+                        'competition_group': group,
+                        'snatch_1': snatch_1,
+                        'snatch_1_result': snatch_1_result,
+                        'snatch_2': snatch_2,
+                        'snatch_2_result': snatch_2_result,
+                        'snatch_3': snatch_3,
+                        'snatch_3_result': snatch_3_result,
+                        'clean_jerk_1': clean_jerk_1,
+                        'clean_jerk_1_result': clean_jerk_1_result,
+                        'clean_jerk_2': clean_jerk_2,
+                        'clean_jerk_2_result': clean_jerk_2_result,
+                        'clean_jerk_3': clean_jerk_3,
+                        'clean_jerk_3_result': clean_jerk_3_result,
+                        'total_kg': total_kg,
+                        'sinclair': sinclair
+                    }
+                    
+                    results.append(result)
+                    
+                except Exception as e:
+                    continue
+        
+        except Exception as e:
+            print(f"Error processing chunk {chunk_num}: {e}")
+        
+        return results
+
+    def _parse_lift_cell(self, cell):
+        """Parse a lift attempt cell"""
+        try:
+            # Check for failed attempts (strikethrough)
+            failed_span = cell.find('span', style=lambda x: x and 'line-through' in x and 'color:red' in x)
+            if failed_span:
+                weight_text = failed_span.get_text().strip()
+                if re.match(r'^\d+(\.\d+)?$', weight_text):
+                    return weight_text, 'u'  # unsuccessful
+                else:
+                    return "", "na"
+            
+            # Get cell text
+            cell_text = cell.get_text().strip()
+            
+            # Check for no attempt
+            if cell_text in ['---', '', '-', '0']:
+                return "", "na"
+            
+            # Check for successful attempt
+            if re.match(r'^\d+(\.\d+)?$', cell_text):
+                return cell_text, 's'  # successful
+            
+            return "", "na"
+            
+        except Exception:
+            return "", "na"
+
+    def save_to_csv(self, all_results, filename='weightlifting_results.csv'):
+        """Save results to CSV file"""
+        try:
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=self.csv_headers)
+                writer.writeheader()
+                
+                for result in all_results:
+                    row = {}
+                    for header in self.csv_headers:
+                        row[header] = result.get(header, '')
+                    writer.writerow(row)
+            
+        except Exception as e:
+            self.logger.error(f"Error saving to CSV: {e}")
+
+    def run(self):
+        """Main scraping process"""
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
+        print("IWRP.net Weightlifting Scraper - PHYSICAL TABLE SEPARATION")
+        print("=" * 60)
+        
+        all_competitions = self.get_homepage_competitions()
+        
+        if not all_competitions:
+            print("No competitions found on homepage")
+            return
+        
+        post_2000_competitions = self.filter_competitions_by_date(all_competitions)
+        
+        print(f"Found {len(all_competitions)} total competitions")
+        print(f"Found {len(post_2000_competitions)} competitions from 2000 onwards")
+        
+        if not post_2000_competitions:
+            print("No competitions found from 2000 onwards")
+            return
+        
+        while True:
+            try:
+                max_competitions = int(input(f"\nHow many competitions to process? (max {len(post_2000_competitions)}): "))
+                if 1 <= max_competitions <= len(post_2000_competitions):
+                    break
+                else:
+                    print(f"Please enter a number between 1 and {len(post_2000_competitions)}")
+            except ValueError:
+                print("Please enter a valid number")
+        
+        competitions_to_process = post_2000_competitions[:max_competitions]
+        
+        all_results = []
+        failed_competitions = []
+        
+        print(f"\nProcessing {len(competitions_to_process)} competitions...")
+        
+        for competition in tqdm(competitions_to_process, desc="Processing competitions"):
+            try:
+                results = self.scrape_competition_page(competition)
+                if results:
+                    all_results.extend(results)
+                else:
+                    failed_competitions.append(competition)
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to process {competition['url']}: {e}")
+                failed_competitions.append(competition)
+                continue
+        
+        if all_results:
+            filename = f"weightlifting_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.save_to_csv(all_results, filename)
+            
+            print(f"\n" + "=" * 60)
+            print(f"Scraping completed!")
+            print(f"Total athletes extracted: {len(all_results)}")
+            print(f"Results saved to: {filename}")
+            
+            # Show weight class distribution
+            weight_classes = defaultdict(int)
+            for result in all_results:
+                weight_classes[result['weight_class']] += 1
+            
+            print(f"\nWeight class distribution:")
+            for weight_class, count in sorted(weight_classes.items()):
+                print(f"  {weight_class}: {count} athletes")
+            
+            # CRITICAL CHECK: Verify no duplicates
+            athlete_names = defaultdict(list)
+            for result in all_results:
+                athlete_names[result['athlete_name']].append(result['weight_class'])
+            
+            duplicates = {name: classes for name, classes in athlete_names.items() if len(set(classes)) > 1}
+            if duplicates:
+                print(f"\n❌ ERROR: Found {len(duplicates)} athletes in multiple weight classes:")
+                for name, classes in list(duplicates.items())[:10]:
+                    print(f"  {name}: {set(classes)}")
+            else:
+                print(f"\n✅ SUCCESS: No athletes found in multiple weight classes!")
+            
+            if failed_competitions:
+                print(f"\nFailed competitions: {len(failed_competitions)}")
+                
+        else:
+            print("\nNo results extracted")
+
+if __name__ == "__main__":
+    scraper = WeightliftingScraper()
+    scraper.run()
